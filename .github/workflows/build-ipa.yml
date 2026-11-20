@@ -1,0 +1,55 @@
+name: Build IPA
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Selecionar Xcode
+        run: |
+          sudo xcode-select -s "$(ls -d /Applications/Xcode_16*.app | sort -V | tail -1)"
+          xcodebuild -version
+
+      - name: Compilar (sem assinatura)
+        run: |
+          set -o pipefail
+          xcodebuild \
+            -project LocApp.xcodeproj \
+            -scheme LocApp \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
+            build > xcodebuild.log 2>&1 || { grep -E "error:" xcodebuild.log; tail -50 xcodebuild.log; exit 1; }
+          test -d build/Build/Products/Release-iphoneos/LocApp.app
+
+      - name: Empacotar .ipa
+        run: |
+          mkdir -p Payload
+          cp -R build/Build/Products/Release-iphoneos/LocApp.app Payload/
+          zip -qry LocApp-unsigned.ipa Payload
+          ls -lh LocApp-unsigned.ipa
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: LocApp-unsigned-ipa
+          path: LocApp-unsigned.ipa
+
+      - name: Publicar release
+        if: github.ref == 'refs/heads/main'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-${{ github.run_number }}
+          name: LocApp build ${{ github.run_number }}
+          files: LocApp-unsigned.ipa
+          body: "IPA sem assinatura. Instale com Sideloadly ou AltStore (eles assinam com seu Apple ID)."
+
+    permissions:
+      contents: write
