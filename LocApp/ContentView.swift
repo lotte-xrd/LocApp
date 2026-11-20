@@ -8,10 +8,8 @@ struct ContentView: View {
     /// Ponto escolhido no mapa (ainda não aplicado).
     @State private var pin = CLLocationCoordinate2D(latitude: -23.561414, longitude: -46.655881) // Av. Paulista
     @State private var position: MapCameraPosition = .automatic
-    @State private var mapCenter: CLLocationCoordinate2D?
-    @State private var cameraTick = 0
-    @State private var isDragging = false
-    @State private var grabOffset: CGSize = .zero
+    @State private var isMoving = false
+    @State private var currentSpan = MKCoordinateSpan(latitudeDelta: 0.015, longitudeDelta: 0.015)
 
     @State private var searchText = ""
     @State private var isSearching = false
@@ -47,14 +45,13 @@ struct ContentView: View {
         .onAppear {
             location.requestPermissionAndStart()
             if let saved = location.simulatedCoordinate { pin = saved }
-            position = .region(MKCoordinateRegion(center: pin, latitudinalMeters: 1500, longitudinalMeters: 1500))
+            moveCamera(to: pin, animated: false, meters: 1500)
         }
         .onReceive(location.$realLocation) { real in
             // Na primeira leitura do GPS (sem simulação salva), leva o pin até você.
             guard !didCenterOnStart, let real, !location.isSimulating else { return }
             didCenterOnStart = true
-            pin = real.coordinate
-            position = .region(MKCoordinateRegion(center: real.coordinate, latitudinalMeters: 1500, longitudinalMeters: 1500))
+            moveCamera(to: real.coordinate, animated: true, meters: 1500)
         }
         .sheet(item: $shareItem) { item in
             ShareSheet(items: [item.url])
@@ -62,7 +59,7 @@ struct ContentView: View {
         }
     }
 
-    // MARK: - Mapa + pin arrastável
+    // MARK: - Mapa + pin fixo no centro
 
     private var mapLayer: some View {
         MapReader { proxy in
@@ -80,46 +77,44 @@ struct ContentView: View {
                     MapCompass()
                     MapScaleView()
                 }
+                // O ponto escolhido é sempre o centro do mapa, onde fica o pin.
                 .onMapCameraChange(frequency: .continuous) { context in
-                    mapCenter = context.region.center
-                    cameraTick &+= 1 // força o pin a acompanhar o mapa
+                    pin = context.region.center
+                    if !isMoving { isMoving = true }
+                }
+                .onMapCameraChange(frequency: .onEnd) { context in
+                    pin = context.region.center
+                    currentSpan = context.region.span
+                    isMoving = false
+                    haptic(.light)
                 }
                 .onTapGesture(coordinateSpace: .named(mapSpace)) { point in
-                    // Toque no mapa: move o pin para lá.
+                    // Toque no mapa: leva aquele ponto até o pin.
                     if let c = proxy.convert(point, from: .named(mapSpace)) {
-                        withAnimation(.snappy) { pin = c }
-                        haptic(.light)
+                        moveCamera(to: c, animated: true)
                     }
                 }
 
-                let _ = cameraTick
-                if let tip = proxy.convert(pin, to: .named(mapSpace)) {
-                    DraggablePin(isDragging: isDragging)
-                        .gesture(
-                            DragGesture(minimumDistance: 0, coordinateSpace: .named(mapSpace))
-                                .onChanged { value in
-                                    if !isDragging {
-                                        isDragging = true
-                                        grabOffset = CGSize(width: tip.x - value.startLocation.x,
-                                                            height: tip.y - value.startLocation.y)
-                                        haptic(.medium)
-                                    }
-                                    let target = CGPoint(x: value.location.x + grabOffset.width,
-                                                         y: value.location.y + grabOffset.height)
-                                    if let c = proxy.convert(target, from: .named(mapSpace)) {
-                                        pin = c
-                                    }
-                                }
-                                .onEnded { _ in
-                                    isDragging = false
-                                    haptic(.light)
-                                }
-                        )
-                        // A ponta do pin fica exatamente sobre a coordenada.
-                        .position(x: tip.x, y: tip.y - DraggablePin.height / 2)
-                }
+                CenterPin(isLifted: isMoving)
+                    .offset(y: -CenterPin.height / 2) // a ponta fica exatamente no centro
+                    .allowsHitTesting(false)
             }
             .coordinateSpace(.named(mapSpace))
+        }
+    }
+
+    private func moveCamera(to c: CLLocationCoordinate2D, animated: Bool, meters: Double? = nil) {
+        pin = c
+        let region: MKCoordinateRegion
+        if let meters {
+            region = MKCoordinateRegion(center: c, latitudinalMeters: meters, longitudinalMeters: meters)
+        } else {
+            region = MKCoordinateRegion(center: c, span: currentSpan)
+        }
+        if animated {
+            withAnimation(.easeInOut(duration: 0.35)) { position = .region(region) }
+        } else {
+            position = .region(region)
         }
     }
 
@@ -151,17 +146,12 @@ struct ContentView: View {
         defer { isSearching = false }
         let request = MKLocalSearch.Request()
         request.naturalLanguageQuery = query
-        if let mapCenter {
-            request.region = MKCoordinateRegion(center: mapCenter, latitudinalMeters: 50_000, longitudinalMeters: 50_000)
-        }
+        request.region = MKCoordinateRegion(center: pin, latitudinalMeters: 50_000, longitudinalMeters: 50_000)
         do {
             let response = try await MKLocalSearch(request: request).start()
             guard let item = response.mapItems.first else { return show("Nada encontrado") }
-            let c = item.placemark.coordinate
-            pin = c
-            withAnimation {
-                position = .region(MKCoordinateRegion(center: c, latitudinalMeters: 1200, longitudinalMeters: 1200))
-            }
+            moveCamera(to: item.placemark.coordinate, animated: true, meters: 1200)
+            UIApplication.shared.sendAction(#selector(UIResponder.resignFirstResponder), to: nil, from: nil, for: nil)
         } catch {
             show("Nada encontrado")
         }
@@ -173,7 +163,7 @@ struct ContentView: View {
         VStack(alignment: .leading, spacing: 12) {
             HStack(alignment: .firstTextBaseline) {
                 VStack(alignment: .leading, spacing: 2) {
-                    Text("Ponto escolhido").font(.caption).foregroundStyle(.secondary)
+                    Text("Arraste o mapa para escolher o ponto").font(.caption).foregroundStyle(.secondary)
                     Text(format(pin))
                         .font(.system(.body, design: .monospaced).weight(.medium))
                         .textSelection(.enabled)
@@ -187,12 +177,16 @@ struct ContentView: View {
                 }
                 .accessibilityLabel("Copiar coordenadas")
                 Button {
-                    if let mapCenter { withAnimation(.snappy) { pin = mapCenter } }
+                    if let real = location.realLocation?.coordinate {
+                        moveCamera(to: real, animated: true)
+                    } else {
+                        show("Sem sinal de GPS ainda")
+                    }
                 } label: {
-                    Image(systemName: "scope")
+                    Image(systemName: "location")
                 }
                 .padding(.leading, 10)
-                .accessibilityLabel("Trazer pin para o centro do mapa")
+                .accessibilityLabel("Ir para minha localização real")
             }
 
             statusRow
@@ -291,25 +285,35 @@ struct ContentView: View {
 
 // MARK: - Componentes
 
-struct DraggablePin: View {
-    static let height: CGFloat = 52
-    var isDragging: Bool
+/// Pin fixo no centro da tela. Quem se move é o mapa.
+struct CenterPin: View {
+    static let height: CGFloat = 56
+    var isLifted: Bool
+
+    private let ink = Color(white: 0.12)
 
     var body: some View {
-        VStack(spacing: -7) {
-            Image(systemName: "mappin.circle.fill")
-                .font(.system(size: 40))
-                .foregroundStyle(Color(.systemBackground), Color(.label))
-            Image(systemName: "arrowtriangle.down.fill")
-                .font(.system(size: 14))
-                .foregroundStyle(Color(.label))
+        ZStack(alignment: .bottom) {
+            // Sombra/alvo no chão marcando o ponto exato.
+            Ellipse()
+                .fill(Color.black.opacity(0.25))
+                .frame(width: isLifted ? 14 : 10, height: isLifted ? 5 : 4)
+                .offset(y: 2)
+
+            VStack(spacing: 0) {
+                ZStack {
+                    Circle().fill(ink).frame(width: 34, height: 34)
+                    Circle().stroke(Color.white, lineWidth: 3).frame(width: 34, height: 34)
+                    Circle().fill(Color.white).frame(width: 11, height: 11)
+                }
+                Rectangle().fill(ink).frame(width: 3, height: 20)
+            }
+            .offset(y: isLifted ? -10 : 0)
+            .shadow(color: .black.opacity(0.3), radius: 4, y: 2)
         }
-        .frame(width: 48, height: Self.height, alignment: .bottom)
-        .shadow(color: .black.opacity(0.3), radius: isDragging ? 8 : 3, y: isDragging ? 6 : 2)
-        .scaleEffect(isDragging ? 1.2 : 1, anchor: .bottom)
-        .animation(.snappy(duration: 0.15), value: isDragging)
-        .contentShape(Rectangle())
-        .accessibilityLabel("Pin arrastável")
+        .frame(width: 40, height: Self.height, alignment: .bottom)
+        .animation(.spring(response: 0.25, dampingFraction: 0.7), value: isLifted)
+        .accessibilityHidden(true)
     }
 }
 
